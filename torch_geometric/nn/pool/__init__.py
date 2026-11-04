@@ -1,7 +1,7 @@
 r"""Pooling package."""
 
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -34,14 +34,30 @@ def _batch_to_ptr(
     if batch is None:
         return None
     # `ptr` can only describe examples whose nodes are stored contiguously.
-    # An unsorted `batch` vector would otherwise silently be mapped to wrong
-    # example boundaries (and thus produce edges across examples):
-    if batch.numel() > 1 and bool((batch[1:] < batch[:-1]).any()):
-        raise ValueError("The 'batch' vector needs to be sorted in ascending "
-                         "order (e.g., via 'batch.argsort(stable=True)')")
+    # An unsorted `batch` vector would silently be mapped to wrong example
+    # boundaries, so callers need to sort it first (via `_sort_batch`).
     if batch_size is None:
         batch_size = int(batch.max()) + 1 if batch.numel() > 0 else 0
     return index2ptr(batch, batch_size)
+
+
+def _sort_batch(batch: OptTensor) -> Tuple[OptTensor, OptTensor]:
+    # Sorts `batch` (stable) in case it is not sorted yet, and returns the
+    # sorted vector together with the applied permutation. The permutation
+    # is `None` if `batch` is already sorted (the common case), so that no
+    # additional work is performed:
+    if batch is None or batch.numel() <= 1:
+        return batch, None
+    if not bool((batch[1:] < batch[:-1]).any()):
+        return batch, None
+    batch, perm = torch.sort(batch, stable=True)
+    return batch, perm
+
+
+def _map_index(index: Tensor, perm: OptTensor) -> Tensor:
+    # Maps indices into the sorted input back to indices into the original
+    # input:
+    return index if perm is None else perm[index]
 
 
 def fps(
@@ -70,8 +86,8 @@ def fps(
             :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
         batch (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch` will be sorted internally. (default: :obj:`None`)
         ratio (float, optional): Sampling ratio. (default: :obj:`0.5`)
         random_start (bool, optional): If set to :obj:`False`, use the first
             node in :math:`\mathbf{X}` as starting node. (default: obj:`True`)
@@ -83,13 +99,18 @@ def fps(
     if not torch_geometric.typing.WITH_FPS:
         raise ImportError("'fps' requires 'pyg-lib>=0.6.0'")
 
+    batch, perm = _sort_batch(batch)
+    if perm is not None:
+        x = x[perm]
+
     if batch is None:
         ptr = torch.tensor([0, x.size(0)], device=x.device, dtype=torch.long)
     else:
         ptr = _batch_to_ptr(batch, batch_size)
 
     src = x.view(x.size(0), -1) if x.dim() > 2 else x
-    return torch.ops.pyg.fps(src, ptr, ratio, random_start)
+    index = torch.ops.pyg.fps(src, ptr, ratio, random_start)
+    return _map_index(index, perm)
 
 
 def knn(
@@ -124,12 +145,12 @@ def knn(
         k (int): The number of neighbors.
         batch_x (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch_x` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_x` will be sorted internally. (default: :obj:`None`)
         batch_y (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
-            node to a specific example. :obj:`batch_y` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_y` will be sorted internally. (default: :obj:`None`)
         cosine (bool, optional): If :obj:`True`, will use the cosine
             distance instead of euclidean distance to find nearest neighbors.
             (default: :obj:`False`)
@@ -144,9 +165,21 @@ def knn(
     if not torch_geometric.typing.WITH_KNN:
         raise ImportError("'knn' requires 'pyg-lib>=0.6.0'")
 
+    batch_x, perm_x = _sort_batch(batch_x)
+    batch_y, perm_y = _sort_batch(batch_y)
+    if perm_x is not None:
+        x = x[perm_x]
+    if perm_y is not None:
+        y = y[perm_y]
+
     ptr_x = _batch_to_ptr(batch_x, batch_size)
     ptr_y = _batch_to_ptr(batch_y, batch_size)
-    return torch.ops.pyg.knn(x, y, ptr_x, ptr_y, k, cosine, num_workers)
+    out = torch.ops.pyg.knn(x, y, ptr_x, ptr_y, k, cosine, num_workers)
+    if perm_x is None and perm_y is None:
+        return out
+    return torch.stack(
+        [_map_index(out[0], perm_y),
+         _map_index(out[1], perm_x)], dim=0)
 
 
 def knn_graph(
@@ -176,8 +209,8 @@ def knn_graph(
         k (int): The number of neighbors.
         batch (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch` will be sorted internally. (default: :obj:`None`)
         loop (bool, optional): If :obj:`True`, the graph will contain
             self-loops. (default: :obj:`False`)
         flow (str, optional): The flow direction when using in combination with
@@ -205,12 +238,17 @@ def knn_graph(
         batch = batch.to(x.device)
 
     assert flow in ['source_to_target', 'target_to_source']
+    batch, perm = _sort_batch(batch)
+    if perm is not None:
+        x = x[perm]
+
     ptr = _batch_to_ptr(batch, batch_size)
     edge_index = torch.ops.pyg.knn(x, x, ptr, ptr, k if loop else k + 1,
                                    cosine, num_workers)
     if not loop:
         mask = edge_index[0] != edge_index[1]
         edge_index = edge_index[:, mask]
+    edge_index = _map_index(edge_index, perm)
     return edge_index.flip([0]) if flow == 'source_to_target' else edge_index
 
 
@@ -246,12 +284,12 @@ def radius(
         r (float): The radius.
         batch_x (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch_x` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_x` will be sorted internally. (default: :obj:`None`)
         batch_y (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
-            node to a specific example. :obj:`batch_y` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_y` will be sorted internally. (default: :obj:`None`)
         max_num_neighbors (int, optional): The maximum number of neighbors to
             return for each element in :obj:`y`. (default: :obj:`32`)
         num_workers (int, optional): Number of workers to use for computation.
@@ -272,10 +310,22 @@ def radius(
     if not torch_geometric.typing.WITH_RADIUS:
         raise ImportError("'radius' requires 'pyg-lib>=0.6.0'")
 
+    batch_x, perm_x = _sort_batch(batch_x)
+    batch_y, perm_y = _sort_batch(batch_y)
+    if perm_x is not None:
+        x = x[perm_x]
+    if perm_y is not None:
+        y = y[perm_y]
+
     ptr_x = _batch_to_ptr(batch_x, batch_size)
     ptr_y = _batch_to_ptr(batch_y, batch_size)
-    return torch.ops.pyg.radius(x, y, ptr_x, ptr_y, r, max_num_neighbors,
-                                num_workers, False)
+    out = torch.ops.pyg.radius(x, y, ptr_x, ptr_y, r, max_num_neighbors,
+                               num_workers, False)
+    if perm_x is None and perm_y is None:
+        return out
+    return torch.stack(
+        [_map_index(out[0], perm_y),
+         _map_index(out[1], perm_x)], dim=0)
 
 
 def radius_graph(
@@ -305,8 +355,8 @@ def radius_graph(
         r (float): The radius.
         batch (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch` will be sorted internally. (default: :obj:`None`)
         loop (bool, optional): If :obj:`True`, the graph will contain
             self-loops. (default: :obj:`False`)
         max_num_neighbors (int, optional): The maximum number of neighbors to
@@ -340,9 +390,14 @@ def radius_graph(
         batch = batch.to(x.device)
 
     assert flow in ['source_to_target', 'target_to_source']
+    batch, perm = _sort_batch(batch)
+    if perm is not None:
+        x = x[perm]
+
     ptr = _batch_to_ptr(batch, batch_size)
     edge_index = torch.ops.pyg.radius(x, x, ptr, ptr, r, max_num_neighbors,
                                       num_workers, not loop)
+    edge_index = _map_index(edge_index, perm)
     return edge_index.flip([0]) if flow == 'source_to_target' else edge_index
 
 
@@ -373,21 +428,31 @@ def nearest(
             :math:`\mathbf{Y} \in \mathbb{R}^{M \times F}`.
         batch_x (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^N`, which assigns each
-            node to a specific example. :obj:`batch_x` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_x` will be sorted internally. (default: :obj:`None`)
         batch_y (torch.Tensor, optional): Batch vector
             :math:`\mathbf{b} \in {\{ 0, \ldots, B-1\}}^M`, which assigns each
-            node to a specific example. :obj:`batch_y` needs to be
-            sorted. (default: :obj:`None`)
+            node to a specific example. If not sorted,
+            :obj:`batch_y` will be sorted internally. (default: :obj:`None`)
 
     :rtype: :class:`torch.Tensor`
     """
     if not torch_geometric.typing.WITH_NEAREST:
         raise ImportError("'nearest' requires 'pyg-lib>=0.6.0'")
 
+    batch_x, perm_x = _sort_batch(batch_x)
+    batch_y, perm_y = _sort_batch(batch_y)
+    if perm_x is not None:
+        x = x[perm_x]
+    if perm_y is not None:
+        y = y[perm_y]
+
     ptr_x = _batch_to_ptr(batch_x)
     ptr_y = _batch_to_ptr(batch_y)
-    return torch.ops.pyg.nearest(x, y, ptr_x, ptr_y)
+    out = _map_index(torch.ops.pyg.nearest(x, y, ptr_x, ptr_y), perm_y)
+    if perm_x is not None:  # Bring `out` back into the original order of `x`:
+        out = out.new_empty(out.size()).scatter_(0, perm_x, out)
+    return out
 
 
 __all__ = [
